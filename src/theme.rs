@@ -257,42 +257,37 @@ pub fn current_theme() -> &'static Base16Palette {
     if index < builtin_count {
         BuiltinTheme::all()[index].palette()
     } else {
-        // For custom themes, we need to return a static reference
-        // Since custom themes are loaded once and stored in CUSTOM_THEMES,
-        // we leak the palette to get a static reference (it lives for program duration anyway)
-        static CUSTOM_PALETTE_CACHE: LazyLock<RwLock<Vec<&'static Base16Palette>>> =
-            LazyLock::new(|| RwLock::new(Vec::new()));
-
-        let custom_index = index - builtin_count;
-
-        // Check if we already have this palette cached
-        if let Ok(cache) = CUSTOM_PALETTE_CACHE.read()
-            && let Some(palette) = cache.get(custom_index)
-        {
-            return palette;
-        }
-
-        // Get the custom theme palette and leak it for static lifetime
-        if let Ok(themes) = CUSTOM_THEMES.read()
-            && let Some(theme) = themes.get(custom_index)
-        {
-            let palette = Box::new(theme.palette.clone());
-            let static_palette: &'static Base16Palette = Box::leak(palette);
-
-            // Cache it
-            if let Ok(mut cache) = CUSTOM_PALETTE_CACHE.write() {
-                while cache.len() <= custom_index {
-                    cache.push(&OCEANIC_NEXT_PALETTE);
-                }
-                cache[custom_index] = static_palette;
-            }
-
-            return static_palette;
-        }
-
-        // Fallback to default
-        &OCEANIC_NEXT_PALETTE
+        custom_palette(index - builtin_count).unwrap_or(&OCEANIC_NEXT_PALETTE)
     }
+}
+
+/// Static palette for a custom theme. Custom themes are loaded once and stored in
+/// CUSTOM_THEMES, so each palette is leaked on first use to get a static reference
+/// (it lives for the program's duration anyway).
+fn custom_palette(custom_index: usize) -> Option<&'static Base16Palette> {
+    // Slots stay None until that theme is first used. A filler palette here was
+    // returned as if it were the real theme, showing wrong colors after switching.
+    static CUSTOM_PALETTE_CACHE: LazyLock<RwLock<Vec<Option<&'static Base16Palette>>>> =
+        LazyLock::new(|| RwLock::new(Vec::new()));
+
+    if let Ok(cache) = CUSTOM_PALETTE_CACHE.read()
+        && let Some(Some(palette)) = cache.get(custom_index)
+    {
+        return Some(palette);
+    }
+
+    let themes = CUSTOM_THEMES.read().ok()?;
+    let theme = themes.get(custom_index)?;
+    let static_palette: &'static Base16Palette = Box::leak(Box::new(theme.palette.clone()));
+
+    if let Ok(mut cache) = CUSTOM_PALETTE_CACHE.write() {
+        if cache.len() <= custom_index {
+            cache.resize(custom_index + 1, None);
+        }
+        cache[custom_index] = Some(static_palette);
+    }
+
+    Some(static_palette)
 }
 
 // ============================================================================
@@ -487,6 +482,40 @@ impl Base16Palette {
             (self.base_02, self.base_06)
         } else {
             (self.base_02, self.base_03)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn custom(name: &str, bg: Color) -> Theme {
+        let mut palette = NORD_PALETTE.clone();
+        palette.base_00 = bg;
+        Theme {
+            name: name.to_string(),
+            palette,
+            is_builtin: false,
+        }
+    }
+
+    #[test]
+    fn custom_theme_lookup_returns_own_palette_regardless_of_visit_order() {
+        let a = Color::Rgb(1, 1, 1);
+        let b = Color::Rgb(2, 2, 2);
+        let c = Color::Rgb(3, 3, 3);
+        *CUSTOM_THEMES.write().unwrap() = vec![custom("A", a), custom("B", b), custom("C", c)];
+
+        // Visit the last custom theme first, as when it is the saved startup theme,
+        // then earlier ones. Each must resolve to its own palette, not a filler.
+        // Uses custom_palette directly so the process-wide current theme is untouched.
+        for (index, want) in [(2, c), (0, a), (1, b), (2, c), (0, a)] {
+            assert_eq!(
+                custom_palette(index).unwrap().base_00,
+                want,
+                "custom theme {index}"
+            );
         }
     }
 }
